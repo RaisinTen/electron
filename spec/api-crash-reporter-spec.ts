@@ -33,6 +33,10 @@ type CrashInfo = {
   longParam: string | undefined
   'electron.v8-fatal.location': string | undefined
   'electron.v8-fatal.message': string | undefined
+  'electron.v8-fatal.js_stack_trace': string | undefined
+  'electron.v8-oom.location': string | undefined
+  'electron.v8-oom.is_heap_oom': string | undefined
+  'electron.v8-oom.js_stack_trace': string | undefined
 }
 
 function checkCrash (expectedProcessType: string, fields: CrashInfo) {
@@ -275,6 +279,55 @@ ifdescribe(!isLinuxOnArm && !process.mas && !process.env.DISABLE_CRASH_REPORTER_
         expect(crash.process_type).to.equal('renderer');
         expect(crash['electron.v8-fatal.location']).to.equal('v8::Context::New()');
         expect(crash['electron.v8-fatal.message']).to.equal('Circular extension dependency');
+        const jsStackTrace = crash['electron.v8-fatal.js_stack_trace'];
+        expect(jsStackTrace).to.be.a('string');
+        const lines = (jsStackTrace as string).trim().split('\n');
+        expect(lines[0]).to.equal('1: :1:51');
+        expect(lines[1]).to.match(/^2: node:electron\/js2c\/renderer_init:\d+:\d+$/);
+        expect(lines[2]).to.match(/^3: node:electron\/js2c\/renderer_init:\d+:\d+$/);
+        expect(lines[3]).to.match(/^4: emit \(node:events:\d+:\d+\)$/);
+        expect(lines[4]).to.match(/^5: onMessage \(node:electron\/js2c\/renderer_init:\d+:\d+\)$/);
+      });
+
+      it('contains v8 crash keys when a v8 OOM crash occurs', async () => {
+        const { remotely } = await startRemoteControlApp();
+        const { port, waitForCrash } = await startServer();
+
+        await remotely((port: number) => {
+          require('electron').crashReporter.start({
+            submitURL: `http://127.0.0.1:${port}`,
+            compress: false,
+            ignoreSystemCrashHandler: true
+          });
+        }, [port]);
+
+        remotely(() => {
+          const { BrowserWindow } = require('electron');
+          const bw = new BrowserWindow({ show: false, webPreferences: { nodeIntegration: true } });
+          bw.loadURL('about:blank');
+          bw.webContents.executeJavaScript(`
+                                           const allocations = []
+                                           while (true) {
+                                             allocations.push(new Array(1e6).fill('*'));
+                                           }
+                                           `);
+        });
+
+        const crash = await waitForCrash();
+        console.log(crash);
+        expect(crash.prod).to.equal('Electron');
+        expect(crash._productName).to.equal('electron-test-remote-control');
+        expect(crash.process_type).to.equal('renderer');
+        expect(crash['electron.v8-oom.location']).to.equal('CALL_AND_RETRY_LAST');
+        expect(crash['electron.v8-oom.is_heap_oom']).to.equal('1');
+        const jsStackTrace = crash['electron.v8-oom.js_stack_trace'];
+        expect(jsStackTrace).to.be.a('string');
+        const lines = (jsStackTrace as string).trim().split('\n');
+        expect(lines[0]).to.equal('1: :4:63');
+        expect(lines[1]).to.match(/^2: node:electron\/js2c\/renderer_init:\d+:\d+$/);
+        expect(lines[2]).to.match(/^3: node:electron\/js2c\/renderer_init:\d+:\d+$/);
+        expect(lines[3]).to.match(/^4: emit \(node:events:\d+:\d+\)$/);
+        expect(lines[4]).to.match(/^5: onMessage \(node:electron\/js2c\/renderer_init:\d+:\d+\)$/);
       });
     });
   });

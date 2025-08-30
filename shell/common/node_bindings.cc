@@ -158,12 +158,75 @@ void stop_and_close_uv_loop(uv_loop_t* loop) {
 
 bool g_is_initialized = false;
 
+std::string FormatStackTrace(
+    v8::Isolate* isolate,
+    v8::Local<v8::StackTrace> stack,
+    node::StackTracePrefix prefix = node::StackTracePrefix::kAt) {
+  std::string result;
+  for (int i = 0; i < stack->GetFrameCount(); i++) {
+    v8::Local<v8::StackFrame> stack_frame = stack->GetFrame(isolate, i);
+    node::Utf8Value fn_name_s(isolate, stack_frame->GetFunctionName());
+    node::Utf8Value script_name(isolate, stack_frame->GetScriptName());
+    const int line_number = stack_frame->GetLineNumber();
+    const int column = stack_frame->GetColumn();
+    std::string prefix_str = prefix == node::StackTracePrefix::kAt
+                                 ? "    at "
+                                 : std::to_string(i + 1) + ": ";
+    if (stack_frame->IsEval()) {
+      if (stack_frame->GetScriptId() == v8::Message::kNoScriptIdInfo) {
+        std::vector<char> buf(64);
+        snprintf(buf.data(), buf.size(), "%s[eval]:%i:%i\n", prefix_str.c_str(),
+                 line_number, column);
+        result += std::string(buf.data());
+      } else {
+        std::vector<char> buf(script_name.length() + 64);
+        snprintf(buf.data(), buf.size(), "%s[eval] (%s:%i:%i)\n",
+                 prefix_str.c_str(), *script_name, line_number, column);
+        result += std::string(buf.data());
+      }
+      break;
+    }
+
+    if (fn_name_s.length() == 0) {
+      std::vector<char> buf(script_name.length() + 64);
+      snprintf(buf.data(), buf.size(), "%s%s:%i:%i\n", prefix_str.c_str(),
+               *script_name, line_number, column);
+      result += std::string(buf.data());
+    } else {
+      std::vector<char> buf(fn_name_s.length() + script_name.length() + 64);
+      snprintf(buf.data(), buf.size(), "%s%s (%s:%i:%i)\n", prefix_str.c_str(),
+               *fn_name_s, *script_name, line_number, column);
+      result += std::string(buf.data());
+    }
+  }
+  return result;
+}
+
+std::optional<std::string> GetStackTrace() {
+  v8::Isolate* isolate = v8::Isolate::TryGetCurrent();
+  if (!isolate) {
+    return std::nullopt;
+  }
+
+  v8::Local<v8::StackTrace> stack;
+  if (!node::GetCurrentStackTrace(isolate).ToLocal(&stack)) {
+    return std::nullopt;
+  }
+
+  return FormatStackTrace(isolate, stack, node::StackTracePrefix::kNumber);
+}
+
 void V8FatalErrorCallback(const char* location, const char* message) {
   LOG(ERROR) << "Fatal error in V8: " << location << " " << message;
+
+  std::optional<std::string> js_stack_trace = GetStackTrace();
+  LOG(ERROR) << "\n\n----- JavaScript stack trace -----\n\n" << *js_stack_trace;
 
 #if !IS_MAS_BUILD()
   electron::crash_keys::SetCrashKey("electron.v8-fatal.message", message);
   electron::crash_keys::SetCrashKey("electron.v8-fatal.location", location);
+  electron::crash_keys::SetCrashKey("electron.v8-fatal.js_stack_trace",
+                                    *js_stack_trace);
 #endif
 
   volatile int* zero = nullptr;
@@ -183,6 +246,12 @@ void V8OOMErrorCallback(const char* location, const v8::OOMDetails& details) {
     LOG(ERROR) << "OOM detail: " << details.detail;
   }
 
+  std::optional<std::string> js_stack_trace = GetStackTrace();
+  if (js_stack_trace.has_value()) {
+    LOG(ERROR) << "\n\n----- JavaScript stack trace -----\n\n"
+               << *js_stack_trace;
+  }
+
 #if !IS_MAS_BUILD()
   electron::crash_keys::SetCrashKey("electron.v8-oom.is_heap_oom",
                                     std::to_string(details.is_heap_oom));
@@ -191,6 +260,10 @@ void V8OOMErrorCallback(const char* location, const v8::OOMDetails& details) {
   }
   if (details.detail) {
     electron::crash_keys::SetCrashKey("electron.v8-oom.detail", details.detail);
+  }
+  if (js_stack_trace.has_value()) {
+    electron::crash_keys::SetCrashKey("electron.v8-oom.js_stack_trace",
+                                      *js_stack_trace);
   }
 #endif
 
